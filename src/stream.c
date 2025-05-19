@@ -1839,6 +1839,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 			sc_shutdown(scf);
 			//sc_report_error(scf); TODO: Be sure it is useless
 			if (!(req->analysers) && !(res->analysers)) {
+				COUNT_IF(1, "Report a client abort (no analysers)");
 				_HA_ATOMIC_INC(&s->be->be_counters.cli_aborts);
 				_HA_ATOMIC_INC(&sess->fe->fe_counters.cli_aborts);
 				if (sess->listener && sess->listener->counters)
@@ -1862,6 +1863,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 			if (srv)
 				_HA_ATOMIC_INC(&srv->counters.failed_resp);
 			if (!(req->analysers) && !(res->analysers)) {
+				COUNT_IF(1, "Report a client abort (no analysers)");
 				_HA_ATOMIC_INC(&s->be->be_counters.srv_aborts);
 				_HA_ATOMIC_INC(&sess->fe->fe_counters.srv_aborts);
 				if (sess->listener && sess->listener->counters)
@@ -2167,6 +2169,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 				if (srv)
 					_HA_ATOMIC_INC(&srv->counters.cli_aborts);
 				s->flags |= SF_ERR_CLICL;
+				COUNT_IF(1, "Report unhandled client error");
 			}
 			else if (req->flags & CF_READ_TIMEOUT) {
 				_HA_ATOMIC_INC(&s->be->be_counters.cli_aborts);
@@ -2176,6 +2179,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 				if (srv)
 					_HA_ATOMIC_INC(&srv->counters.cli_aborts);
 				s->flags |= SF_ERR_CLITO;
+				COUNT_IF(1, "Report unhandled client timeout (RD)");
 			}
 			else {
 				_HA_ATOMIC_INC(&s->be->be_counters.srv_aborts);
@@ -2185,6 +2189,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 				if (srv)
 					_HA_ATOMIC_INC(&srv->counters.srv_aborts);
 				s->flags |= SF_ERR_SRVTO;
+				COUNT_IF(1, "Report unhandled server timeout (WR)");
 			}
 			sess_set_term_flags(s);
 
@@ -2213,6 +2218,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 				if (srv)
 					_HA_ATOMIC_INC(&srv->counters.srv_aborts);
 				s->flags |= SF_ERR_SRVCL;
+				COUNT_IF(1, "Report unhandled server error");
 			}
 			else if (res->flags & CF_READ_TIMEOUT) {
 				_HA_ATOMIC_INC(&s->be->be_counters.srv_aborts);
@@ -2222,6 +2228,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 				if (srv)
 					_HA_ATOMIC_INC(&srv->counters.srv_aborts);
 				s->flags |= SF_ERR_SRVTO;
+				COUNT_IF(1, "Report unhandled server timeout (RD)");
 			}
 			else {
 				_HA_ATOMIC_INC(&s->be->be_counters.cli_aborts);
@@ -2231,6 +2238,7 @@ struct task *process_stream(struct task *t, void *context, unsigned int state)
 				if (srv)
 					_HA_ATOMIC_INC(&srv->counters.cli_aborts);
 				s->flags |= SF_ERR_CLITO;
+				COUNT_IF(1, "Report unhandled client timeout (WR)");
 			}
 			sess_set_term_flags(s);
 		}
@@ -2788,11 +2796,28 @@ void stream_shutdown_self(struct stream *stream, int why)
 	if (stream->scb->flags & (SC_FL_SHUT_DONE|SC_FL_SHUT_WANTED))
 		return;
 
-	sc_schedule_shutdown(stream->scb);
-	sc_schedule_abort(stream->scb);
 	stream->task->nice = 1024;
 	if (!(stream->flags & SF_ERR_MASK))
 		stream->flags |= why;
+
+	if (objt_server(stream->target)) {
+		if (stream->flags & SF_CURR_SESS) {
+			stream->flags &= ~SF_CURR_SESS;
+			_HA_ATOMIC_DEC(&__objt_server(stream->target)->cur_sess);
+		}
+
+		sess_change_server(stream, NULL);
+		if (may_dequeue_tasks(objt_server(stream->target), stream->be))
+			process_srv_queue(objt_server(stream->target));
+	}
+
+	/* shutw is enough to stop a connecting socket */
+	stream->scb->flags |= SC_FL_ERROR | SC_FL_NOLINGER;
+	sc_shutdown(stream->scb);
+
+	stream->scb->state = SC_ST_CLO;
+	if (stream->srv_error)
+		stream->srv_error(stream, stream->scb);
 }
 
 /* dumps an error message for type <type> at ptr <ptr> related to stream <s>,

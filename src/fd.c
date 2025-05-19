@@ -354,8 +354,10 @@ void _fd_delete_orphan(int fd)
 	/* perform the close() call last as it's what unlocks the instant reuse
 	 * of this FD by any other thread.
 	 */
-	if (!fd_disown)
+	if (!fd_disown) {
+		fdtab[fd].generation++;
 		close(fd);
+	}
 	_HA_ATOMIC_DEC(&ha_used_fds);
 }
 
@@ -540,6 +542,9 @@ int fd_takeover(int fd, void *expected_owner)
 	 * is supposed to call subscribe() later, to activate polling.
 	 */
 	fd_stop_recv(fd);
+
+	/* essentially for debugging */
+	fdtab[fd].nb_takeover++;
 
 	/* we're done with it */
 	HA_ATOMIC_AND(&fdtab[fd].running_mask, ~ti->ltid_bit);

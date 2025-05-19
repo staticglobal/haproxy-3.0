@@ -858,13 +858,14 @@ out_ok:
 	return err;
 }
 
-/* Allocate an address for the destination endpoint
- * The address is taken from the currently assigned server, or from the
- * dispatch or transparent address.
+/* Allocate <*ss> address unless already set. Address is then set to the
+ * destination endpoint of <srv> server, or via <s> from a dispatch or
+ * transparent address.
  *
- * Returns SRV_STATUS_OK on success. Does nothing if the address was
- * already set.
- * On error, no address is allocated and SRV_STATUS_INTERNAL is returned.
+ * Note that no address is allocated if server relies on reverse HTTP.
+ *
+ * Returns SRV_STATUS_OK on success, or if already already set. Else an error
+ * code is returned and <*ss> is not allocated.
  */
 static int alloc_dst_address(struct sockaddr_storage **ss,
                              struct server *srv, struct stream *s)
@@ -873,6 +874,11 @@ static int alloc_dst_address(struct sockaddr_storage **ss,
 
 	if (*ss)
 		return SRV_STATUS_OK;
+
+	if (srv && (srv->flags & SRV_F_RHTTP)) {
+		/* For reverse HTTP, destination address is unknown. */
+		return SRV_STATUS_OK;
+	}
 
 	if ((s->flags & SF_DIRECT) || (s->be->lbprm.algo & BE_LB_KIND)) {
 		/* A server is necessarily known for this stream */
@@ -1151,6 +1157,15 @@ int alloc_bind_address(struct sockaddr_storage **ss,
 			return SRV_STATUS_INTERNAL;
 
 		**ss = *addr;
+		if ((src->opts & CO_SRC_TPROXY_MASK) == CO_SRC_TPROXY_CIP) {
+			/* always set port to zero when using "clientip", or
+			 * the idle connection hash will include the port part.
+			 */
+			if (addr->ss_family == AF_INET)
+				((struct sockaddr_in *)*ss)->sin_port = 0;
+			else if (addr->ss_family == AF_INET6)
+				((struct sockaddr_in6 *)*ss)->sin6_port = 0;
+		}
 		break;
 
 	case CO_SRC_TPROXY_DYN:
@@ -1433,8 +1448,7 @@ int connect_server(struct stream *s)
 	}
 
 	/* 3. destination address */
-	if (srv && srv_is_transparent(srv))
-		hash_params.dst_addr = s->scb->dst;
+	hash_params.dst_addr = s->scb->dst;
 
 	/* 4. source address */
 	hash_params.src_addr = bind_addr;
@@ -1665,6 +1679,9 @@ skip_reuse:
 			srv_conn->src = bind_addr;
 			bind_addr = NULL;
 
+			/* copy the target address into the connection */
+			*srv_conn->dst = *s->scb->dst;
+
 			/* mark? */
 			if (s->flags & SF_BC_MARK) {
 				srv_conn->mark = s->bc_mark;
@@ -1687,9 +1704,6 @@ skip_reuse:
 	/* srv_conn is still NULL only on allocation failure */
 	if (!srv_conn)
 		return SF_ERR_RESOURCE;
-
-	/* copy the target address into the connection */
-	*srv_conn->dst = *s->scb->dst;
 
 	/* Copy network namespace from client connection */
 	srv_conn->proxy_netns = cli_conn ? cli_conn->proxy_netns : NULL;

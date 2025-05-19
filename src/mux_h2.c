@@ -732,6 +732,16 @@ static void h2c_update_timeout(struct h2c *h2c)
 	} else {
 		h2c->task->expire = TICK_ETERNITY;
 	}
+
+	/* Timer may already be expired, in this case it must not be requeued.
+	 * Currently it may happen with idle conn calculation based on shut or
+	 * http-req/ka timeouts.
+	 */
+	if (unlikely(tick_is_expired(h2c->task->expire, now_ms))) {
+		task_wakeup(h2c->task, TASK_WOKEN_TIMER);
+		goto leave;
+	}
+
 	task_queue(h2c->task);
  leave:
 	TRACE_LEAVE(H2_EV_H2C_WAKE);
@@ -3513,6 +3523,8 @@ static int h2_conn_reverse(struct h2c *h2c)
 		struct proxy *prx = l->bind_conf->frontend;
 
 		h2c->flags &= ~H2_CF_IS_BACK;
+		/* Must manually init max_id so that GOAWAY can be emitted. */
+		h2c->max_id = 0;
 
 		h2c->shut_timeout = h2c->timeout = prx->timeout.client;
 		if (tick_isset(prx->timeout.clientfin))

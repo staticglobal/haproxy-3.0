@@ -529,6 +529,7 @@ static ssize_t h3_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 	unsigned int flags = HTX_SL_F_NONE;
 	struct ist meth = IST_NULL, path = IST_NULL;
 	struct ist scheme = IST_NULL, authority = IST_NULL;
+	struct ist v;
 	int hdr_idx, ret;
 	int cookie = -1, last_cookie = -1, i;
 	const char *ctl;
@@ -732,6 +733,37 @@ static ssize_t h3_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 	flags |= HTX_SL_F_VER_11;
 	flags |= HTX_SL_F_XFER_LEN;
 
+	/* RFC 9114 4.3.1. Request Pseudo-Header Fields
+	 *
+	 * This pseudo-header field MUST NOT be empty for "http" or "https"
+	 * URIs; "http" or "https" URIs that do not contain a path component
+	 * MUST include a value of / (ASCII 0x2f). An OPTIONS request that
+	 * does not include a path component includes the value * (ASCII
+	 * 0x2a) for the :path pseudo-header field; see Section 7.1 of
+	 * [HTTP].
+	 */
+	if ((isteqi(scheme, ist("http")) || isteqi(scheme, ist("https"))) &&
+	    (!istlen(path) ||
+	     (istptr(path)[0] != '/' && !isteq(path, ist("*"))))) {
+		TRACE_ERROR("invalid ':path' pseudo-header", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
+		h3s->err = H3_ERR_MESSAGE_ERROR;
+		qcc_report_glitch(h3c->qcc, 1);
+		len = -1;
+		goto out;
+	}
+
+	/* Ensure that final URI does not contains LWS nor CTL characters. */
+	for (i = 0; i < path.len; i++) {
+		unsigned char c = istptr(path)[i];
+		if (HTTP_IS_LWS(c) || HTTP_IS_CTL(c)) {
+			TRACE_ERROR("invalid character in path", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
+			h3s->err = H3_ERR_MESSAGE_ERROR;
+			qcc_report_glitch(h3c->qcc, 1);
+			len = -1;
+			goto out;
+		}
+	}
+
 	sl = htx_add_stline(htx, HTX_BLK_REQ_SL, flags, meth, path, ist("HTTP/3.0"));
 	if (!sl) {
 		len = -1;
@@ -838,6 +870,7 @@ static ssize_t h3_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 		else if (isteq(list[hdr_idx].n, ist("connection")) ||
 		         isteq(list[hdr_idx].n, ist("proxy-connection")) ||
 		         isteq(list[hdr_idx].n, ist("keep-alive")) ||
+			 isteq(list[hdr_idx].n, ist("upgrade")) ||
 		         isteq(list[hdr_idx].n, ist("transfer-encoding"))) {
 			/* RFC 9114 4.2. HTTP Fields
 		         *
@@ -869,7 +902,15 @@ static ssize_t h3_headers_to_htx(struct qcs *qcs, const struct buffer *buf,
 			goto out;
 		}
 
-		if (!htx_add_header(htx, list[hdr_idx].n, list[hdr_idx].v)) {
+		/* trim leading/trailing LWS */
+		for (v = list[hdr_idx].v; v.len; v.len--) {
+			if (unlikely(HTTP_IS_LWS(*v.ptr)))
+				v.ptr++;
+			else if (!unlikely(HTTP_IS_LWS(v.ptr[v.len - 1])))
+				break;
+		}
+
+		if (!htx_add_header(htx, list[hdr_idx].n, v)) {
 			len = -1;
 			goto out;
 		}
@@ -972,6 +1013,7 @@ static ssize_t h3_trailers_to_htx(struct qcs *qcs, const struct buffer *buf,
 	int hdr_idx, ret;
 	const char *ctl;
 	int qpack_err;
+	struct ist v;
 	int i;
 
 	TRACE_ENTER(H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
@@ -1048,6 +1090,7 @@ static ssize_t h3_trailers_to_htx(struct qcs *qcs, const struct buffer *buf,
 		    isteq(list[hdr_idx].n, ist("connection")) ||
 		    isteq(list[hdr_idx].n, ist("proxy-connection")) ||
 		    isteq(list[hdr_idx].n, ist("keep-alive")) ||
+		    isteq(list[hdr_idx].n, ist("upgrade")) ||
 		    isteq(list[hdr_idx].n, ist("te")) ||
 		    isteq(list[hdr_idx].n, ist("transfer-encoding"))) {
 			TRACE_ERROR("forbidden HTTP/3 headers", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
@@ -1077,7 +1120,15 @@ static ssize_t h3_trailers_to_htx(struct qcs *qcs, const struct buffer *buf,
 			goto out;
 		}
 
-		if (!htx_add_trailer(htx, list[hdr_idx].n, list[hdr_idx].v)) {
+		/* trim leading/trailing LWS */
+		for (v = list[hdr_idx].v; v.len; v.len--) {
+			if (unlikely(HTTP_IS_LWS(*v.ptr)))
+				v.ptr++;
+			else if (!unlikely(HTTP_IS_LWS(v.ptr[v.len - 1])))
+				break;
+		}
+
+		if (!htx_add_trailer(htx, list[hdr_idx].n, v)) {
 			TRACE_ERROR("cannot add trailer", H3_EV_RX_FRAME|H3_EV_RX_HDR, qcs->qcc->conn, qcs);
 			len = -1;
 			goto out;
@@ -1565,6 +1616,29 @@ static int h3_control_send(struct qcs *qcs, void *ctx)
 	return -1;
 }
 
+/* Encode header field name <n> value <v> into <buf> buffer using QPACK. Strip
+ * any leading/trailing WS in value prior to encoding.
+ *
+ * Returns 0 on success else non zero.
+ */
+static int h3_encode_header(struct buffer *buf,
+                            const struct ist n, const struct ist v)
+{
+	struct ist v_strip;
+	char *ptr;
+
+	/* trim leading/trailing LWS */
+	for (v_strip = v; istlen(v_strip); --v_strip.len) {
+		ptr = istptr(v_strip);
+		if (unlikely(HTTP_IS_LWS(*ptr)))
+			++v_strip.ptr;
+		else if (!unlikely(HTTP_IS_LWS(ptr[istlen(v_strip) - 1])))
+			break;
+	}
+
+	return qpack_encode_header(buf, n, v_strip);
+}
+
 static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 {
 	int err;
@@ -1662,6 +1736,7 @@ static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 		if (isteq(list[hdr].n, ist("connection")) ||
 		    isteq(list[hdr].n, ist("proxy-connection")) ||
 		    isteq(list[hdr].n, ist("keep-alive")) ||
+		    isteq(list[hdr].n, ist("upgrade")) ||
 		    isteq(list[hdr].n, ist("transfer-encoding"))) {
 			continue;
 		}
@@ -1675,7 +1750,7 @@ static int h3_resp_headers_send(struct qcs *qcs, struct htx *htx)
 			list[hdr].v = ist("trailers");
 		}
 
-		if (qpack_encode_header(&headers_buf, list[hdr].n, list[hdr].v))
+		if (h3_encode_header(&headers_buf, list[hdr].n, list[hdr].v))
 			goto err;
 	}
 
@@ -1824,12 +1899,13 @@ static int h3_resp_trailers_send(struct qcs *qcs, struct htx *htx)
 		    isteq(list[hdr].n, ist("connection")) ||
 		    isteq(list[hdr].n, ist("proxy-connection")) ||
 		    isteq(list[hdr].n, ist("keep-alive")) ||
+		    isteq(list[hdr].n, ist("upgrade")) ||
 		    isteq(list[hdr].n, ist("te")) ||
 		    isteq(list[hdr].n, ist("transfer-encoding"))) {
 			continue;
 		}
 
-		if (qpack_encode_header(&headers_buf, list[hdr].n, list[hdr].v)) {
+		if (h3_encode_header(&headers_buf, list[hdr].n, list[hdr].v)) {
 			TRACE_STATE("not enough room for all trailers", H3_EV_TX_FRAME|H3_EV_TX_HDR, qcs->qcc->conn, qcs);
 			if (qcc_release_stream_txbuf(qcs))
 				goto end;
